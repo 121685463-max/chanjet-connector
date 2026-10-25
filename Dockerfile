@@ -7,7 +7,11 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# 使用火山引擎内网 PyPI 镜像（火山广州服务器直连 pypi.org 慢）
+RUN pip install --no-cache-dir \
+    -i https://mirrors.ivolces.com/pypi/simple/ \
+    --trusted-host mirrors.ivolces.com \
+    -r requirements.txt
 
 COPY app ./app
 
