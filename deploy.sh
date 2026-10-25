@@ -4,7 +4,8 @@ set -euo pipefail
 
 IMAGE=chanjet-connector
 CONTAINER=chanjet-connector
-PORT=8000
+# 宿主监听端口（8000 已被主后端占用，改用 8010）
+PORT=8010
 
 # 读取 .env（若存在）
 ENV_ARGS=()
