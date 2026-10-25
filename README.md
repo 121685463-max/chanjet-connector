@@ -39,7 +39,7 @@ FastAPI + httpx + SQLite + Docker。
 ```bash
 # 服务器上
 cp .env.example .env   # 填入凭证
-./deploy.sh
+bash deploy.sh         # 用 bash 执行，避免 git 拉取后丢失可执行位
 ```
 
 容器仅监听 `127.0.0.1:8000`，由 openresty 反代 `/api/v1/auth/callback/chanjet` 与 `/api/` 前缀。
