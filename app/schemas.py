@@ -9,14 +9,9 @@ from pydantic import BaseModel, Field
 class HealthResponse(BaseModel):
     status: str = "ok"
     configured: bool = False
+    certificate_configured: bool = False
+    message_secret_configured: bool = False
     version: str = "1.0.0"
-
-
-class CallbackResponse(BaseModel):
-    ok: bool
-    user_id: Optional[str] = None
-    org_id: Optional[str] = None
-    message: str = ""
 
 
 class AccountBook(BaseModel):

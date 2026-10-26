@@ -1,6 +1,6 @@
-"""token 持久化存储。
+"""token / appTicket 持久化存储。
 
-使用 SQLite（单文件、零运维），存 token / 到期时间 / 企业信息。
+使用 SQLite（单文件、零运维），存 token / appTicket / 到期时间 / 企业信息。
 """
 from __future__ import annotations
 
@@ -12,6 +12,9 @@ from typing import Optional
 from .logger import get_logger
 
 log = get_logger("chanjet.token_store")
+
+# appTicket 有效期（秒），平台每 10 分钟推一次，每个 ticket 有效 30 分钟
+APP_TICKET_TTL_SECONDS = 1800
 
 
 class TokenStore:
@@ -56,49 +59,28 @@ class TokenStore:
                 (key, value, int(time.time())),
             )
 
-    # ---- 业务字段 ----
+    # ---- token ----
 
-    def save_token(self, data: dict) -> None:
-        for key in (
-            "access_token",
-            "refresh_token",
-            "expires_in",
-            "refresh_expires_in",
-            "user_id",
-            "org_id",
-            "user_auth_permanent_code",
-            "sid",
-            "app_name",
-        ):
-            if key in data and data[key] is not None:
-                self._set(key, str(data[key]))
+    def save_generated_token(self, value: dict) -> None:
+        """保存 generateToken 返回值（camelCase 字段，映射到 snake_case 存储）。"""
+        mapping = {
+            "accessToken": "access_token",
+            "refreshToken": "refresh_token",
+            "expiresIn": "expires_in",
+            "refreshExpiresIn": "refresh_expires_in",
+            "userId": "user_id",
+            "orgId": "org_id",
+            "appName": "app_name",
+            "scope": "scope",
+        }
+        for src, dst in mapping.items():
+            if src in value and value[src] is not None:
+                self._set(dst, str(value[src]))
         # 记录拿到 token 的时间戳，用于计算过期
         self._set("obtained_at", str(int(time.time())))
 
-    def load_token(self) -> dict:
-        out: dict = {}
-        for key in (
-            "access_token",
-            "refresh_token",
-            "expires_in",
-            "refresh_expires_in",
-            "user_id",
-            "org_id",
-            "user_auth_permanent_code",
-            "sid",
-            "app_name",
-            "obtained_at",
-        ):
-            val = self._get(key)
-            if val is not None:
-                out[key] = val
-        return out
-
     def get_access_token(self) -> Optional[str]:
         return self._get("access_token")
-
-    def get_refresh_token(self) -> Optional[str]:
-        return self._get("refresh_token")
 
     def is_access_expiring(self, ahead_seconds: int) -> bool:
         obtained = self._get("obtained_at")
@@ -108,4 +90,20 @@ class TokenStore:
         obtained_ts = int(obtained)
         expires_s = int(expires)
         remaining = (obtained_ts + expires_s) - int(time.time())
+        return remaining < ahead_seconds
+
+    # ---- appTicket ----
+
+    def save_app_ticket(self, app_ticket: str) -> None:
+        self._set("app_ticket", app_ticket)
+        self._set("app_ticket_obtained_at", str(int(time.time())))
+
+    def get_app_ticket(self) -> Optional[str]:
+        return self._get("app_ticket")
+
+    def is_app_ticket_expiring(self, ahead_seconds: int) -> bool:
+        obtained = self._get("app_ticket_obtained_at")
+        if not obtained:
+            return True
+        remaining = (int(obtained) + APP_TICKET_TTL_SECONDS) - int(time.time())
         return remaining < ahead_seconds

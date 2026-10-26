@@ -1,21 +1,23 @@
 """畅捷通易代账连接器 - FastAPI 入口。
 
 提供：
-- 健康检查（验证回调可达，不依赖凭证）
-- OAuth 授权入口 + 回调
+- 健康检查（验证服务可达，不依赖凭证）
+- 消息接收（解密平台推送的 appTicket，落库）
+- 触发 appTicket 推送（联调辅助）
 - 帐套列表 / 资产负债表 / 明细账
 
-鉴权：服务内部持有 org 级 token，接口以内部调用为主；
-所有可写/敏感操作不做公网暴露，仅提供只读拉取。
+鉴权：自建应用模式。服务内部持有 openToken（appTicket + 软证书换得），
+接口以内部调用为主；消息接收地址由 openresty 反代暴露给畅捷通平台。
 """
 from __future__ import annotations
 
+import json
 import re
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 
 from .chanjet_client import ChanjetClient, ChanjetError
 from .config import get_settings
@@ -23,7 +25,6 @@ from .logger import get_logger
 from .schemas import (
     AccountBooksResponse,
     BalanceSheetResponse,
-    CallbackResponse,
     DetailLedgerResponse,
     HealthResponse,
 )
@@ -43,22 +44,31 @@ def _require_configured() -> None:
         raise HTTPException(status_code=503, detail="未配置 CHANJET_APP_KEY/CHANJET_APP_SECRET")
 
 
+def _generate_token() -> str:
+    """用最新 appTicket + 软证书生成 openToken 并落库。"""
+    if not settings.certificate_configured:
+        raise HTTPException(status_code=503, detail="尚未配置软证书 CHANJET_CERTIFICATE")
+    app_ticket = store.get_app_ticket()
+    if not app_ticket:
+        raise HTTPException(
+            status_code=503,
+            detail="尚未收到 appTicket，请确认消息接收地址已配置并触发推送",
+        )
+    try:
+        value = client.generate_token(app_ticket, settings.certificate)
+        store.save_generated_token(value)
+        log.info("self-built token generated, user_id=%s org_id=%s",
+                 value.get("userId"), value.get("orgId"))
+        return value["accessToken"]
+    except ChanjetError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
 def _valid_token() -> str:
-    """取可用 token，必要时刷新。"""
+    """取可用 token，必要时用最新 appTicket 重新生成。"""
     token = store.get_access_token()
-    if not token:
-        raise HTTPException(status_code=401, detail="尚未授权，请先走 OAuth 授权流程")
-    if store.is_access_expiring(settings.token_refresh_ahead_seconds):
-        refresh_token = store.get_refresh_token()
-        if refresh_token:
-            try:
-                result = client.refresh(refresh_token)
-                store.save_token(result)
-                token = store.get_access_token()
-                log.info("token refreshed")
-            except ChanjetError as exc:
-                log.warning("token refresh failed: %s", exc)
-                # 刷新失败但 token 可能仍可用，继续用旧 token 尝试
+    if not token or store.is_access_expiring(settings.token_refresh_ahead_seconds):
+        token = _generate_token()
     return token
 
 
@@ -70,7 +80,10 @@ def _period(period: str) -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("chanjet-connector started, configured=%s", settings.configured)
+    log.info(
+        "chanjet-connector started, configured=%s certificate=%s message_secret=%s",
+        settings.configured, settings.certificate_configured, settings.message_secret_configured,
+    )
     yield
     try:
         client._http.close()
@@ -83,45 +96,58 @@ app = FastAPI(title="畅捷通易代账连接器", version="1.0.0", lifespan=lif
 
 @app.get("/healthz", response_model=HealthResponse)
 async def healthz():
-    return HealthResponse(configured=settings.configured)
+    return HealthResponse(
+        configured=settings.configured,
+        certificate_configured=settings.certificate_configured,
+        message_secret_configured=settings.message_secret_configured,
+    )
 
 
-@app.get("/api/v1/auth/authorize/chanjet")
-async def authorize():
-    """跳转畅捷通授权页。"""
-    _require_configured()
-    url = client.build_authorize_url()
-    return RedirectResponse(url=url)
+@app.post("/api/v1/chanjet/message")
+async def receive_message(request: Request):
+    """接收畅捷通平台推送（appTicket / 地址校验 APP_TEST），AES 解密后落库。
 
-
-@app.get("/api/v1/auth/callback/chanjet", response_model=CallbackResponse)
-async def callback(
-    code: Optional[str] = Query(default=None),
-    orgId: Optional[str] = Query(default=None),
-    error: Optional[str] = Query(default=None),
-):
-    """授权回调：用 code 换 token 并落库。"""
-    _require_configured()
-    if error:
-        raise HTTPException(status_code=400, detail=f"授权被拒绝: {error}")
-    if not code:
-        raise HTTPException(status_code=400, detail="缺少 code 参数")
+    平台要求 1s 内返回 {"result":"success"}，否则按阶梯重试（最多 20 次）。
+    """
     try:
-        result = client.exchange_code(code)
+        body = await request.json()
+    except Exception:
+        # 非 JSON 直接 ack，避免重试风暴
+        return JSONResponse({"result": "success"})
+
+    if not settings.message_secret_configured:
+        # 无法解密，返回失败让平台校验地址时发现密钥未就绪
+        log.error("receive_message: CHANJET_MESSAGE_SECRET 未配置，无法解密")
+        return JSONResponse({"result": "fail"}, status_code=500)
+
+    encrypt_msg = body.get("encryptMsg") if isinstance(body, dict) else None
+    if not encrypt_msg:
+        return JSONResponse({"result": "success"})
+
+    try:
+        msg = client.decrypt_message(encrypt_msg, settings.message_secret)
+    except ChanjetError as exc:
+        log.error("receive_message decrypt failed: %s", exc)
+        # 返回失败，暴露消息密钥不匹配，让平台重试/标记地址不可用
+        return JSONResponse({"result": "fail"}, status_code=500)
+
+    log.info("receive_message decrypted: %s", json.dumps(msg, ensure_ascii=False))
+    app_ticket = client.extract_app_ticket(msg)
+    if app_ticket:
+        store.save_app_ticket(app_ticket)
+        log.info("appTicket 已更新 (msgType=%s)", msg.get("msgType"))
+    return JSONResponse({"result": "success"})
+
+
+@app.post("/api/v1/chanjet/trigger-ticket")
+async def trigger_ticket():
+    """立即触发平台推送 appTicket（联调辅助，内部调用）。"""
+    _require_configured()
+    try:
+        client.trigger_app_ticket_push()
     except ChanjetError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    # 回调可能带 orgId，合并进结果，便于后续企业维度区分
-    if orgId:
-        result.setdefault("org_id", orgId)
-    store.save_token(result)
-    log.info("oauth callback success, user_id=%s org_id=%s",
-             result.get("user_id"), result.get("org_id"))
-    return CallbackResponse(
-        ok=True,
-        user_id=result.get("user_id"),
-        org_id=result.get("org_id"),
-        message="授权成功",
-    )
+    return {"result": "success", "message": "已触发 appTicket 推送"}
 
 
 @app.get("/api/v1/chanjet/account-books", response_model=AccountBooksResponse)

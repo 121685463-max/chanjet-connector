@@ -21,36 +21,30 @@ class Settings:
     """服务配置。"""
 
     def __init__(self) -> None:
-        # 畅捷通开放平台应用凭证（沙箱/正式用同一域名，靠 appKey 区分）
+        # 畅捷通开放平台「自建应用」凭证（靠 appKey 区分应用）
         self.app_key: str = _env("CHANJET_APP_KEY")
         self.app_secret: str = _env("CHANJET_APP_SECRET")
 
-        # OAuth 回调地址（必须与开放平台应用里配置的完全一致，且不能带 query）
-        self.redirect_uri: str = _env(
-            "CHANJET_REDIRECT_URI",
-            "http://101.96.216.161/api/v1/auth/callback/chanjet",
-        )
+        # 自建应用软证书（应用管理员授权后获得）
+        self.certificate: str = _env("CHANJET_CERTIFICATE")
 
-        # API 网关 / 授权页
+        # 消息密钥（环境密钥）：ISV 自配 16 位字母数字，用于 AES 解密平台推送的 appTicket
+        self.message_secret: str = _env("CHANJET_MESSAGE_SECRET")
+
+        # API 网关
         self.api_base: str = _env("CHANJET_API_BASE", "https://openapi.chanjet.com").rstrip("/")
-        self.authorize_base: str = _env(
-            "CHANJET_AUTHORIZE_BASE", "https://market.chanjet.com/user/v2/authorize"
-        ).rstrip("/")
-
-        # 易代账应用名固定 ydzee；授权范围固定 auth_all
-        self.app_name: str = _env("CHANJET_APP_NAME", "ydzee")
-        self.scope: str = _env("CHANJET_SCOPE", "auth_all")
-
-        # 授权时需要的企业ID（orgId）。为空则走「获取工作台管理帐套ID」等已授权流程补齐；
-        # 沙箱联调时由协调器/用户提供。
-        self.org_id: str = _env("CHANJET_ORG_ID", "")
 
         # token 持久化
         self.db_path: str = _env("CHANJET_DB_PATH", "/data/chanjet.db")
 
-        # 提前多少秒刷新 token（access_token 默认 6 天，这里预留 10 分钟安全窗）
+        # 提前多少秒刷新 token（自建应用 token 无独立刷新接口，到期用最新 appTicket 重新生成）
         self.token_refresh_ahead_seconds: int = int(
             _env("CHANJET_TOKEN_REFRESH_AHEAD_SECONDS", "600")
+        )
+
+        # appTicket 有效期为 30 分钟，剩余不足该秒数时视为需要新 ticket
+        self.app_ticket_refresh_ahead_seconds: int = int(
+            _env("CHANJET_APP_TICKET_REFRESH_AHEAD_SECONDS", "900")
         )
 
         # HTTP 超时
@@ -60,5 +54,15 @@ class Settings:
 
     @property
     def configured(self) -> bool:
-        """是否已配置应用凭证。未配置时仍可启动，便于先验回调可达，再注入凭证。"""
+        """是否已配置应用凭证。未配置时仍可启动，便于先验消息地址可达，再注入凭证。"""
         return bool(self.app_key and self.app_secret)
+
+    @property
+    def certificate_configured(self) -> bool:
+        """软证书是否就绪（拿 openToken 必需）。"""
+        return bool(self.certificate)
+
+    @property
+    def message_secret_configured(self) -> bool:
+        """消息密钥是否就绪（解密 appTicket 必需）。"""
+        return bool(self.message_secret)
